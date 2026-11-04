@@ -88,6 +88,8 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
+  p->in_ready = 0;
+  p->priority = 5;
 
   release(&ptable.lock);
 
@@ -216,7 +218,14 @@ fork(void)
 
   acquire(&ptable.lock);
 
+/* R1: derive child priority from parent priority. */
+  if(curproc->priority >= 15)
+  np->priority = curproc->priority / 2;
+  else
+  np->priority = curproc->priority + 1;
+
   np->state = RUNNABLE;
+  ready_enqueue(np);
 
   release(&ptable.lock);
 
@@ -326,37 +335,34 @@ scheduler(void)
 {
   struct proc *p;
   struct cpu *c = mycpu();
+
   c->proc = 0;
-  
+
   for(;;){
-    // Enable interrupts on this processor.
     sti();
 
-    // Loop over process table looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
 
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
+    p = ready_pop();
+
+    if(p != 0){
+      if(p->state != RUNNABLE)
+        panic("scheduler bad state");
+
       c->proc = p;
       switchuvm(p);
+
       p->state = RUNNING;
 
-      swtch(&(c->scheduler), p->context);
-      switchkvm();
+      swtch(&c->scheduler, p->context);
 
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
+      switchkvm();
       c->proc = 0;
     }
-    release(&ptable.lock);
 
+    release(&ptable.lock);
   }
 }
-
 // Enter scheduler.  Must hold only ptable.lock
 // and have changed proc->state. Saves and restores
 // intena because intena is a property of this
@@ -385,11 +391,17 @@ sched(void)
 
 // Give up the CPU for one scheduling round.
 void
+void
 yield(void)
 {
-  acquire(&ptable.lock);  //DOC: yieldlock
-  myproc()->state = RUNNABLE;
+  struct proc *p = myproc();
+
+  acquire(&ptable.lock);
+
+  p->state = RUNNABLE;
+  ready_enqueue(p);
   sched();
+
   release(&ptable.lock);
 }
 
@@ -457,15 +469,18 @@ sleep(void *chan, struct spinlock *lk)
 // Wake up all processes sleeping on chan.
 // The ptable lock must be held.
 static void
+static void
 wakeup1(void *chan)
 {
   struct proc *p;
 
-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    if(p->state == SLEEPING && p->chan == chan)
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state == SLEEPING && p->chan == chan){
       p->state = RUNNABLE;
+      ready_enqueue(p);
+    }
+  }
 }
-
 // Wake up all processes sleeping on chan.
 void
 wakeup(void *chan)
@@ -488,8 +503,10 @@ kill(int pid)
     if(p->pid == pid){
       p->killed = 1;
       // Wake process from sleep if necessary.
-      if(p->state == SLEEPING)
-        p->state = RUNNABLE;
+     if(p->state == SLEEPING){
+       p->state = RUNNABLE;
+       ready_enqueue(p);
+}
       release(&ptable.lock);
       return 0;
     }
@@ -538,14 +555,24 @@ procdump(void)
 int
 setnice(int pid, int nice)
 {
-  if( nice < 0 || nice > 30)
+  struct proc *p;
+
+  if(nice < 0 || nice > 30)
     return -1;
 
-  struct proc *p;
   acquire(&ptable.lock);
-  for( p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-    if(p->pid==pid){
-      p->priority = nice;
+
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state != UNUSED && p->pid == pid){
+
+      if(p->state == RUNNABLE){
+        ready_remove(p);
+        p->priority = nice;
+        ready_enqueue(p);
+      } else {
+        p->priority = nice;
+      }
+
       release(&ptable.lock);
       return 0;
     }
@@ -553,4 +580,30 @@ setnice(int pid, int nice)
 
   release(&ptable.lock);
   return -1;
+}
+
+/*
+ * Call only at a safe scheduling point, with no other
+ * spinlocks held and no extra pushcli nesting.
+ */
+void
+priority_preempt(void)
+{
+  struct proc *p = myproc();
+
+  if(p == 0)
+    return;
+
+  acquire(&ptable.lock);
+
+  if(p->state == RUNNING &&
+     ready_count > 0 &&
+     higher(ready[0], p)){
+
+    p->state = RUNNABLE;
+    ready_enqueue(p);
+    sched();
+  }
+
+  release(&ptable.lock);
 }
