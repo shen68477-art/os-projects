@@ -19,6 +19,90 @@ extern void forkret(void);
 extern void trapret(void);
 
 static void wakeup1(void *chan);
+static struct proc *ready[NPROC];
+static int ready_count;
+
+/* Caller must hold ptable.lock. */
+static int
+higher(struct proc *a, struct proc *b)
+{
+  if(a->priority != b->priority)
+    return a->priority < b->priority;
+
+  return a->pid > b->pid;
+}
+
+/* Insert a RUNNABLE process in priority order. */
+static void
+ready_enqueue(struct proc *p)
+{
+  int i;
+
+  if(!holding(&ptable.lock))
+    panic("enqueue without lock");
+
+  if(p->state != RUNNABLE)
+    panic("enqueue bad state");
+
+  if(p->in_ready)
+    panic("duplicate enqueue");
+
+  if(ready_count >= NPROC)
+    panic("ready queue full");
+
+  i = ready_count;
+  while(i > 0 && higher(p, ready[i - 1])){
+    ready[i] = ready[i - 1];
+    i--;
+  }
+
+  ready[i] = p;
+  ready_count++;
+  p->in_ready = 1;
+}
+
+/* Remove a process, for example before changing its priority. */
+static void
+ready_remove(struct proc *p)
+{
+  int i, j;
+
+  if(!holding(&ptable.lock))
+    panic("remove without lock");
+
+  if(!p->in_ready)
+    return;
+
+  for(i = 0; i < ready_count; i++){
+    if(ready[i] == p){
+      for(j = i; j + 1 < ready_count; j++)
+        ready[j] = ready[j + 1];
+
+      ready_count--;
+      ready[ready_count] = 0;
+      p->in_ready = 0;
+      return;
+    }
+  }
+
+  panic("ready queue corrupt");
+}
+
+static struct proc *
+ready_pop(void)
+{
+  struct proc *p;
+
+  if(!holding(&ptable.lock))
+    panic("pop without lock");
+
+  if(ready_count == 0)
+    return 0;
+
+  p = ready[0];
+  ready_remove(p);
+  return p;
+}
 
 void
 pinit(void)
