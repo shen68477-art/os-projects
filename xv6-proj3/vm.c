@@ -6,6 +6,7 @@
 #include "mmu.h"
 #include "proc.h"
 #include "elf.h"
+#define PTE_COW 0x200
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
@@ -318,26 +319,36 @@ copyuvm(pde_t *pgdir, uint sz)
   pde_t *d;
   pte_t *pte;
   uint pa, i, flags;
-  char *mem;
 
   if((d = setupkvm()) == 0)
     return 0;
+
+  // Set up the child's mappings before changing the parent's permissions.
   for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
+    if((pte = walkpgdir(pgdir, (void*)i, 0)) == 0)
       panic("copyuvm: pte should exist");
     if(!(*pte & PTE_P))
       panic("copyuvm: page not present");
+
     pa = PTE_ADDR(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
+    if((flags & (PTE_U | PTE_W)) == (PTE_U | PTE_W))
+      flags = (flags & ~PTE_W) | PTE_COW;
+
+    if(mappages(d, (void*)i, PGSIZE, pa, flags) < 0)
       goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
-    }
+    inc_refcount(pa);
   }
+  // Protect the same pages in the parent's page table.
+  for(i = 0; i < sz; i += PGSIZE){
+    pte = walkpgdir(pgdir, (void*)i, 0);
+    if((*pte & (PTE_U | PTE_W)) == (PTE_U | PTE_W))
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+  }
+
+  lcr3(V2P(pgdir));
   return d;
+
 
 bad:
   freevm(d);
