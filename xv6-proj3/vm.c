@@ -373,6 +373,17 @@ uva2ka(pde_t *pgdir, char *uva)
 // Copy len bytes from p to user address va in page table pgdir.
 // Most useful when pgdir is not the current page table.
 // uva2ka ensures this only works for PTE_U pages.
+va0 = PGROUNDDOWN(va);
+pte = walkpgdir(pgdir, (void*)va0, 0);
+if(pte == 0 || (*pte & (PTE_P | PTE_U)) != (PTE_P | PTE_U))
+  return -1;
+
+if((*pte & PTE_COW) && cow_make_writable(pgdir, va0) < 0)
+  return -1;
+
+pa0 = uva2ka(pgdir, (char*)va0);
+if(pa0 == 0)
+  return -1;
 int
 copyout(pde_t *pgdir, uint va, void *p, uint len)
 {
@@ -396,16 +407,56 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
   return 0;
 }
 
-void
-page_fault(void)
+// Resolve a write to a present user CoW page.
+// Return 0 on success, or -1 if the page cannot be made writable.
+static int
+cow_make_writable(pde_t *pgdir, uint va)
 {
-  uint va = rcr2();
-  if(va < 0) {
-    panic("Invalid access");
-    return;
+  pte_t *pte;
+  uint pa, flags;
+  char *mem;
+
+  if(va >= KERNBASE)
+    return -1;
+
+  va = PGROUNDDOWN(va);
+  pte = walkpgdir(pgdir, (void*)va, 0);
+  if(pte == 0 ||
+     (*pte & (PTE_P | PTE_U | PTE_COW)) != (PTE_P | PTE_U | PTE_COW))
+    return -1;
+
+  pa = PTE_ADDR(*pte);
+  flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_COW;
+
+  if(get_refcount(pa) == 1){
+    *pte = pa | flags;
+    asm volatile("invlpg (%0)" : : "r" (va) : "memory");
+    return 0;
   }
-  
-  return;
+
+  mem = kalloc();
+  if(mem == 0)
+    return -1;
+
+  memmove(mem, P2V(pa), PGSIZE);
+  *pte = V2P(mem) | flags;
+  asm volatile("invlpg (%0)" : : "r" (va) : "memory");
+  dec_refcount(pa);
+  return 0;
+}
+
+int
+page_fault(pde_t *pgdir, uint sz, uint err)
+{
+  uint va;
+
+  va = rcr2();
+
+  // x86 error bits 0 and 1 indicate a protection violation on a write.
+  if((err & 0x3) != 0x3 || va >= sz)
+    return -1;
+
+  return cow_make_writable(pgdir, va);
 }
 
 //PAGEBREAK!
